@@ -150,6 +150,9 @@ def eval_policy(
                 observation, current_arm_q = process_images_and_observations(
                     tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam, arm_ctrl
                 )
+                for k, v in observation.items():
+                    print(k, type(v), None if v is None else getattr(v, "shape", None))
+                print("current_arm_q:", type(current_arm_q), None if current_arm_q is None else current_arm_q.shape)
                 left_ee_state = right_ee_state = np.array([])
                 if cfg.ee:
                     with ee_shared_mem["lock"]:
@@ -252,6 +255,8 @@ def eval_main(cfg: EvalRealConfig):
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         },
     )
+    
+    print(getattr(cfg, "sim", False))
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         eval_policy(cfg, dataset, policy, preprocessor, postprocessor)

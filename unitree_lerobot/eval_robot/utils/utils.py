@@ -119,6 +119,7 @@ class EvalRealConfig:
 
     root: str = ""
     episodes: int = 0
+    save_dir: str = "eval_outputs"
     frequency: float = 30.0
 
     # Basic control parameters

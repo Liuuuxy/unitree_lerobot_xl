@@ -8,11 +8,13 @@ import torch
 import tqdm
 import logging
 import time
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pprint import pformat
 from typing import Any
 from dataclasses import asdict
+from pathlib import Path
 from torch import nn
 from contextlib import nullcontext
 from lerobot.policies.factory import make_policy, make_pre_post_processors
@@ -46,6 +48,67 @@ logging_mp.basic_config(level=logging_mp.INFO)
 logger_mp = logging_mp.get_logger(__name__)
 
 
+def make_eval_output_dir(cfg: EvalRealConfig) -> Path:
+    policy_name = "random_policy"
+    if cfg.policy is not None and cfg.policy.pretrained_path:
+        policy_path = Path(str(cfg.policy.pretrained_path))
+        if policy_path.name == "pretrained_model" and len(policy_path.parents) >= 3:
+            policy_name = policy_path.parents[2].name
+        else:
+            policy_name = policy_path.parent.name
+
+    repo_name = cfg.repo_id.replace("/", "__")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(cfg.save_dir) / repo_name / policy_name / f"episode_{cfg.episodes:04d}_{timestamp}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def compute_action_metrics(
+    ground_truth_actions: np.ndarray,
+    predicted_actions: np.ndarray,
+) -> dict[str, float | list[float] | int]:
+    diff = predicted_actions - ground_truth_actions
+    abs_diff = np.abs(diff)
+    sq_diff = diff**2
+
+    return {
+        "num_steps": int(ground_truth_actions.shape[0]),
+        "action_dim": int(ground_truth_actions.shape[1]),
+        "mae": float(abs_diff.mean()),
+        "mse": float(sq_diff.mean()),
+        "rmse": float(np.sqrt(sq_diff.mean())),
+        "max_abs_error": float(abs_diff.max()),
+        "mae_per_dim": abs_diff.mean(axis=0).tolist(),
+        "mse_per_dim": sq_diff.mean(axis=0).tolist(),
+        "rmse_per_dim": np.sqrt(sq_diff.mean(axis=0)).tolist(),
+    }
+
+
+def save_eval_artifacts(
+    output_dir: Path,
+    episode_index: int,
+    ground_truth_actions: np.ndarray,
+    predicted_actions: np.ndarray,
+    metrics: dict[str, float | list[float] | int],
+) -> dict[str, str]:
+    gt_path = output_dir / f"episode_{episode_index:04d}_ground_truth_actions.npy"
+    pred_path = output_dir / f"episode_{episode_index:04d}_predicted_actions.npy"
+    metrics_path = output_dir / f"episode_{episode_index:04d}_metrics.json"
+    figure_path = output_dir / f"episode_{episode_index:04d}_action_comparison.png"
+
+    np.save(gt_path, ground_truth_actions)
+    np.save(pred_path, predicted_actions)
+    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+
+    return {
+        "ground_truth_actions": str(gt_path),
+        "predicted_actions": str(pred_path),
+        "metrics": str(metrics_path),
+        "figure": str(figure_path),
+    }
+
+
 def eval_policy(
     cfg: EvalRealConfig,
     dataset: LeRobotDataset,
@@ -56,6 +119,8 @@ def eval_policy(
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
     logger_mp.info(f"Arguments: {cfg}")
+    output_dir = make_eval_output_dir(cfg)
+    logger_mp.info(f"Saving eval artifacts to: {output_dir}")
 
     if cfg.visualization:
         rerun_logger = RerunLogger()
@@ -66,10 +131,10 @@ def eval_policy(
         preprocessor.reset()
         postprocessor.reset()
 
-    # init pose  dataset.meta.episodes["dataset_from_index"][episode_index]
-    from_idx = dataset.meta.episodes["dataset_from_index"][0]
-    step = dataset[from_idx]
-    to_idx = dataset.meta.episodes["dataset_to_index"][0]
+    if len(dataset) == 0:
+        raise ValueError(f"Episode {cfg.episodes} produced an empty dataset selection.")
+
+    step = dataset[0]
 
     ground_truth_actions = []
     predicted_actions = []
@@ -94,7 +159,7 @@ def eval_policy(
 
             time.sleep(1)
 
-        for step_idx in tqdm.tqdm(range(from_idx, to_idx)):
+        for step_idx in tqdm.tqdm(range(len(dataset))):
             loop_start_time = time.perf_counter()
 
             step = dataset[step_idx]
@@ -144,6 +209,14 @@ def eval_policy(
 
         ground_truth_actions = np.array(ground_truth_actions)
         predicted_actions = np.array(predicted_actions)
+        metrics = compute_action_metrics(ground_truth_actions, predicted_actions)
+        saved_paths = save_eval_artifacts(
+            output_dir=output_dir,
+            episode_index=cfg.episodes,
+            ground_truth_actions=ground_truth_actions,
+            predicted_actions=predicted_actions,
+            metrics=metrics,
+        )
 
         # Get the number of timesteps and action dimensions
         n_timesteps, n_dims = ground_truth_actions.shape
@@ -168,7 +241,22 @@ def eval_policy(
         # plt.show()
 
         time.sleep(1)
-        plt.savefig("figure.png")
+        plt.savefig(saved_paths["figure"])
+        plt.close(fig)
+
+        logger_mp.info("Evaluation metrics:")
+        logger_mp.info(
+            "  MAE=%.6f MSE=%.6f RMSE=%.6f MaxAbsErr=%.6f",
+            metrics["mae"],
+            metrics["mse"],
+            metrics["rmse"],
+            metrics["max_abs_error"],
+        )
+        logger_mp.info("Saved files:")
+        logger_mp.info("  ground truth actions: %s", saved_paths["ground_truth_actions"])
+        logger_mp.info("  predicted actions: %s", saved_paths["predicted_actions"])
+        logger_mp.info("  metrics json: %s", saved_paths["metrics"])
+        logger_mp.info("  comparison figure: %s", saved_paths["figure"])
 
 
 @parser.wrap()
@@ -183,7 +271,8 @@ def eval_main(cfg: EvalRealConfig):
 
     logging.info("Making policy.")
 
-    dataset = LeRobotDataset(repo_id=cfg.repo_id)
+    dataset_root = cfg.root if cfg.root else None
+    dataset = LeRobotDataset(repo_id=cfg.repo_id, root=dataset_root, episodes=[cfg.episodes])
 
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
     policy.eval()

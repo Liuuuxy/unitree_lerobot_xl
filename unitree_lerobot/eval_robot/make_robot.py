@@ -4,6 +4,7 @@ import numpy as np
 import argparse
 import threading
 import torch
+import os
 from unitree_lerobot.eval_robot.image_server.image_client import ImageClient
 from unitree_lerobot.eval_robot.robot_control.robot_arm import (
     G1_29_ArmController,
@@ -68,14 +69,36 @@ EE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
+def _parse_optional_bool(value: Any) -> bool | None:
+    """Parse bool-like values from config/env while tolerating common typos."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on", "ture"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return None
+
+
 def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
     """Initializes and starts the image client and shared memory."""
+    sim_mode = bool(getattr(args, "sim", False))
+    binocular_override = _parse_optional_bool(getattr(args, "binocular", None))
+    if binocular_override is None:
+        binocular_override = _parse_optional_bool(os.getenv("BINOCULAR"))
+
     # image client: img_config should be the same as the configuration in image_server.py (of Robot's development computing unit)
-    if getattr(args, "sim", False):
+    if sim_mode:
+        # In sim we default to binocular unless explicitly disabled.
+        use_binocular = True if binocular_override is None else binocular_override
+        sim_head_width = 1280 if use_binocular else 640
         img_config = {
             "fps": 30,
             "head_camera_type": "opencv",
-            "head_camera_image_shape": [480, 640],  # Head camera resolution
+            "head_camera_image_shape": [480, sim_head_width],  # Head camera resolution
             "head_camera_id_numbers": [0],
             "wrist_camera_type": "opencv",
             "wrist_camera_image_shape": [480, 640],  # Wrist camera resolution
@@ -114,7 +137,10 @@ def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
     tv_img_shm = shared_memory.SharedMemory(create=True, size=np.prod(tv_img_shape) * np.uint8().itemsize)
     tv_img_array = np.ndarray(tv_img_shape, dtype=np.uint8, buffer=tv_img_shm.buf)
 
-    if WRIST and getattr(args, "sim", False):
+    wrist_img_shape = None
+    wrist_img_shm = None
+    wrist_img_array = None
+    if WRIST and sim_mode:
         wrist_img_shape = (img_config["wrist_camera_image_shape"][0], img_config["wrist_camera_image_shape"][1] * 2, 3)
         wrist_img_shm = shared_memory.SharedMemory(create=True, size=np.prod(wrist_img_shape) * np.uint8().itemsize)
         wrist_img_array = np.ndarray(wrist_img_shape, dtype=np.uint8, buffer=wrist_img_shm.buf)
@@ -125,7 +151,7 @@ def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
             wrist_img_shm_name=wrist_img_shm.name,
             server_address="127.0.0.1",
         )
-    elif WRIST and not getattr(args, "sim", False):
+    elif WRIST and not sim_mode:
         wrist_img_shape = (img_config["wrist_camera_image_shape"][0], img_config["wrist_camera_image_shape"][1] * 2, 3)
         wrist_img_shm = shared_memory.SharedMemory(create=True, size=np.prod(wrist_img_shape) * np.uint8().itemsize)
         wrist_img_array = np.ndarray(wrist_img_shape, dtype=np.uint8, buffer=wrist_img_shm.buf)
@@ -241,13 +267,22 @@ def process_images_and_observations(
     current_tv_image = tv_img_array.copy()
     current_wrist_image = wrist_img_array.copy() if has_wrist_cam else None
 
+    print("is_binocular flag:", is_binocular)
+    print("tv_img_shape:", tv_img_shape)
+    print("actual tv image shape:", None if current_tv_image is None else current_tv_image.shape)
+
     left_top_cam = current_tv_image[:, : tv_img_shape[1] // 2] if is_binocular else current_tv_image
     right_top_cam = current_tv_image[:, tv_img_shape[1] // 2 :] if is_binocular else None
+    left_top_cam = np.ascontiguousarray(left_top_cam)
+    if right_top_cam is not None:
+        right_top_cam = np.ascontiguousarray(right_top_cam)
 
     left_wrist_cam = right_wrist_cam = None
     if has_wrist_cam and current_wrist_image is not None:
         left_wrist_cam = current_wrist_image[:, : wrist_img_shape[1] // 2]
         right_wrist_cam = current_wrist_image[:, wrist_img_shape[1] // 2 :]
+        left_wrist_cam = np.ascontiguousarray(left_wrist_cam)
+        right_wrist_cam = np.ascontiguousarray(right_wrist_cam)
     observation = {
         "observation.images.cam_left_high": torch.from_numpy(left_top_cam),
         "observation.images.cam_right_high": torch.from_numpy(right_top_cam) if is_binocular else None,

@@ -11,6 +11,12 @@ python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
     --repo-id your_name/g1_grabcube_double_hand \
     --robot_type Unitree_G1_Dex3 \
     --push_to_hub
+
+python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py \
+    --raw-dir $HOME/datasets/g1_grabcube_double_hand \
+    --repo-id your_name/g1_grabcube_left_only \
+    --robot_type Unitree_G1_Dex3 \
+    --side left
 """
 
 import os
@@ -18,7 +24,6 @@ import cv2
 import tqdm
 import tyro
 import json
-import glob
 import dataclasses
 import shutil
 import numpy as np
@@ -29,7 +34,7 @@ from typing import Literal
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from unitree_lerobot.utils.constants import ROBOT_CONFIGS
+from unitree_lerobot.utils.constants import ROBOT_CONFIGS, RobotConfig
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,7 +50,7 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 
 
 class JsonDataset:
-    def __init__(self, data_dirs: Path, robot_type: str) -> None:
+    def __init__(self, data_dirs: Path, robot_config: RobotConfig) -> None:
         """
         Initialize the dataset for loading and processing HDF5 files containing robot manipulation data.
 
@@ -53,29 +58,51 @@ class JsonDataset:
             data_dirs: Path to directory containing training data
         """
         assert data_dirs is not None, "Data directory cannot be None"
-        assert robot_type is not None, "Robot type cannot be None"
+        assert robot_config is not None, "Robot config cannot be None"
         self.data_dirs = data_dirs
         self.json_file = "data.json"
+        self.json_state_data_name = robot_config.json_state_data_name
+        self.json_action_data_name = robot_config.json_action_data_name
+        self.camera_to_image_key = robot_config.camera_to_image_key
 
         # Initialize paths and cache
         self._init_paths()
         self._init_cache()
-        self.json_state_data_name = ROBOT_CONFIGS[robot_type].json_state_data_name
-        self.json_action_data_name = ROBOT_CONFIGS[robot_type].json_action_data_name
-        self.camera_to_image_key = ROBOT_CONFIGS[robot_type].camera_to_image_key
+        self.available_cameras = self._infer_available_cameras()
 
     def _init_paths(self) -> None:
         """Initialize episode and task paths."""
 
         self.episode_paths = []
         self.task_paths = []
+        root_path = Path(self.data_dirs)
+        if not root_path.exists():
+            raise FileNotFoundError(f"Raw data directory does not exist: {root_path}")
 
-        for task_path in glob.glob(os.path.join(self.data_dirs, "*")):
-            if os.path.isdir(task_path):
-                episode_paths = glob.glob(os.path.join(task_path, "*"))
-                if episode_paths:
-                    self.task_paths.append(task_path)
-                    self.episode_paths.extend(episode_paths)
+        # Support both layouts:
+        # 1) raw_dir/episode_xxxx/data.json
+        # 2) raw_dir/task_name/episode_xxxx/data.json
+        for candidate in sorted(root_path.iterdir()):
+            if not candidate.is_dir():
+                continue
+
+            if (candidate / self.json_file).is_file():
+                self.episode_paths.append(str(candidate))
+                continue
+
+            nested_episode_paths = [
+                str(subdir)
+                for subdir in sorted(candidate.iterdir())
+                if subdir.is_dir() and (subdir / self.json_file).is_file()
+            ]
+            if nested_episode_paths:
+                self.task_paths.append(str(candidate))
+                self.episode_paths.extend(nested_episode_paths)
+
+        if not self.episode_paths:
+            raise FileNotFoundError(
+                f"No episode directories containing '{self.json_file}' were found under: {root_path}"
+            )
 
         self.episode_paths = sorted(self.episode_paths)
         self.episode_ids = list(range(len(self.episode_paths)))
@@ -96,6 +123,23 @@ class JsonDataset:
         print(f"==> Cached {len(self.episodes_data_cached)} episodes")
 
         return self.episodes_data_cached
+
+    def _infer_available_cameras(self) -> list[str]:
+        """Infer available mapped camera names from cached JSON episodes."""
+        available = set()
+        for episode_data in self.episodes_data_cached:
+            for sample_data in episode_data.get("data", []):
+                for camera_key in sample_data.get("colors", {}).keys():
+                    mapped_key = self.camera_to_image_key.get(camera_key)
+                    if mapped_key:
+                        available.add(mapped_key)
+
+        available_list = sorted(available)
+        if available_list:
+            print(f"==> Detected cameras in JSON: {available_list}")
+        else:
+            print("==> Warning: No mapped color cameras detected in JSON.")
+        return available_list
 
     def _extract_data(self, episode_data: dict, key: str, parts: list[str]) -> np.ndarray:
         """
@@ -186,7 +230,9 @@ class JsonDataset:
         cameras = self._parse_images(file_path, episode_data)
 
         # Extract camera configuration
-        cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
+        cam_height = cam_width = None
+        if cameras:
+            cam_height, cam_width = next(img for imgs in cameras.values() if imgs for img in imgs).shape[:2]
         data_cfg = {
             "camera_names": list(cameras.keys()),
             "cam_height": cam_height,
@@ -211,12 +257,15 @@ def create_empty_dataset(
     robot_type: str,
     mode: Literal["video", "image"] = "video",
     *,
+    robot_config: RobotConfig | None = None,
+    cameras: list[str] | None = None,
     has_velocity: bool = False,
     has_effort: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
-    motors = ROBOT_CONFIGS[robot_type].motors
-    cameras = ROBOT_CONFIGS[robot_type].cameras
+    resolved_robot_config = robot_config if robot_config is not None else ROBOT_CONFIGS[robot_type]
+    motors = resolved_robot_config.motors
+    cameras = cameras if cameras is not None else resolved_robot_config.cameras
 
     features = {
         "observation.state": {
@@ -282,10 +331,8 @@ def create_empty_dataset(
 
 def populate_dataset(
     dataset: LeRobotDataset,
-    raw_dir: Path,
-    robot_type: str,
+    json_dataset: JsonDataset,
 ) -> LeRobotDataset:
-    json_dataset = JsonDataset(raw_dir, robot_type)
     for i in tqdm.tqdm(range(len(json_dataset))):
         episode = json_dataset.get_item(i)
 
@@ -313,11 +360,61 @@ def populate_dataset(
     return dataset
 
 
+def select_robot_config(robot_type: str, side: Literal["both", "left", "right"]) -> RobotConfig:
+    base_config = ROBOT_CONFIGS[robot_type]
+    if side == "both":
+        return base_config
+
+    side_title = side.title()
+    side_prefix = f"{side}_"
+    side_camera_prefix = f"cam_{side}_"
+
+    motors = [motor for motor in base_config.motors if motor.startswith(f"k{side_title}")]
+    cameras = [camera for camera in base_config.cameras if camera.startswith(side_camera_prefix)]
+    camera_to_image_key = {key: val for key, val in base_config.camera_to_image_key.items() if val in cameras}
+    json_state_data_name = [part for part in base_config.json_state_data_name if part.startswith(side_prefix)]
+    json_action_data_name = [part for part in base_config.json_action_data_name if part.startswith(side_prefix)]
+
+    if not motors:
+        raise ValueError(
+            f"Robot type '{robot_type}' does not expose any motors for side='{side}'. "
+            "Use side='both' or update the robot config."
+        )
+    if not json_state_data_name or not json_action_data_name:
+        raise ValueError(
+            f"Robot type '{robot_type}' does not expose any state/action parts for side='{side}'. "
+            "Use side='both' or update the robot config."
+        )
+
+    if not cameras:
+        print(f"==> Warning: No cameras matched side='{side}'. Continuing with state/action only.")
+
+    print(
+        "==> Using side filter:",
+        {
+            "side": side,
+            "motors": motors,
+            "state_parts": json_state_data_name,
+            "action_parts": json_action_data_name,
+            "cameras": cameras,
+        },
+    )
+
+    return RobotConfig(
+        motors=motors,
+        cameras=cameras,
+        camera_to_image_key=camera_to_image_key,
+        json_state_data_name=json_state_data_name,
+        json_action_data_name=json_action_data_name,
+    )
+
+
 def json_to_lerobot(
     raw_dir: Path,
     repo_id: str,
     robot_type: str,  # e.g., Unitree_Z1_Single, Unitree_Z1_Dual, Unitree_G1_Dex1, Unitree_G1_Dex3, Unitree_G1_Brainco, Unitree_G1_Inspire
     *,
+    side: Literal["both", "left", "right"] = "both",
     push_to_hub: bool = False,
     mode: Literal["video", "image"] = "video",
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
@@ -325,18 +422,23 @@ def json_to_lerobot(
     if (HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
 
+    selected_robot_config = select_robot_config(robot_type, side)
+    json_dataset = JsonDataset(raw_dir, selected_robot_config)
+    target_cameras = json_dataset.available_cameras or selected_robot_config.cameras
+
     dataset = create_empty_dataset(
         repo_id,
         robot_type=robot_type,
         mode=mode,
+        robot_config=selected_robot_config,
+        cameras=target_cameras,
         has_effort=False,
         has_velocity=False,
         dataset_config=dataset_config,
     )
     dataset = populate_dataset(
         dataset,
-        raw_dir,
-        robot_type=robot_type,
+        json_dataset,
     )
 
     if push_to_hub:

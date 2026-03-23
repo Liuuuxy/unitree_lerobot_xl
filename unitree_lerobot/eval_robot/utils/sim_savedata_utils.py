@@ -184,6 +184,7 @@ class EvalRealConfig:
     motion: bool = False
     headless: bool = False
     sim: bool = True
+    binocular: bool = True
     visualization: bool = False
     send_real_robot: bool = False
     use_dataset: bool = False

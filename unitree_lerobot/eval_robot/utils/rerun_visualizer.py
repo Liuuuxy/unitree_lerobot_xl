@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from datetime import datetime
 from typing import Any
 
@@ -36,6 +37,7 @@ class RerunLogger:
         self._episode_index_key: str = "episode_index"
 
         self.current_episode = -1
+        self._all_zero_warned: set[str] = set()
 
     def _initialize_from_data(self, step_data: dict[str, Any]):
         """Inspects the first data dictionary to discover components and set up the blueprint."""
@@ -134,24 +136,59 @@ class RerunLogger:
         for key in self._image_keys:
             if key in step_data:
                 image_tensor = step_data[key]
+                if image_tensor is None:
+                    continue
                 if image_tensor.ndim > 2:
                     clean_name = key.replace("observation.images.", "")
                     entity_path = f"{self.prefix}images/{clean_name}"
-                    if image_tensor.shape[0] in [1, 3, 4]:
-                        image_tensor = image_tensor.permute(1, 2, 0)
-                    rr.log(entity_path, rr.Image(image_tensor))
+                    # Normalize all incoming image tensors/arrays to contiguous HWC numpy
+                    # for stable Rerun rendering.
+                    if isinstance(image_tensor, torch.Tensor):
+                        image = image_tensor.detach().cpu()
+                        if image.shape[0] in [1, 3, 4]:
+                            image = image.permute(1, 2, 0)
+                        image = image.numpy()
+                    else:
+                        image = np.asarray(image_tensor)
+                        if image.ndim == 3 and image.shape[0] in [1, 3, 4]:
+                            image = np.transpose(image, (1, 2, 0))
+
+                    if image.ndim == 2:
+                        image = image[..., None]
+
+                    if image.dtype != np.uint8:
+                        image = np.nan_to_num(image, nan=0.0, posinf=255.0, neginf=0.0)
+                        if image.max() <= 1.0:
+                            image = (image * 255.0).clip(0, 255).astype(np.uint8)
+                        else:
+                            image = image.clip(0, 255).astype(np.uint8)
+
+                    # OpenCV decoded frames are BGR; convert to RGB for correct colors.
+                    if image.ndim == 3 and image.shape[2] == 3:
+                        image = image[..., ::-1]
+
+                    image = np.ascontiguousarray(image)
+
+                    if image.size > 0 and int(image.max()) == 0 and clean_name not in self._all_zero_warned:
+                        print(
+                            f"[RerunLogger] Warning: '{clean_name}' image is all zeros. "
+                            "Likely no valid frames are being written into shared memory."
+                        )
+                        self._all_zero_warned.add(clean_name)
+
+                    rr.log(entity_path, rr.Image(image))
 
         if self._state_key in step_data:
             state_tensor = step_data[self._state_key]
             entity_path = f"{self.prefix}state"
             for i, val in enumerate(state_tensor):
-                rr.log(f"{entity_path}/joint_{i}", rr.Scalar(val.item()))
+                rr.log(f"{entity_path}/joint_{i}", rr.Scalars(val.item()))
 
         if self._action_key in step_data:
             action_tensor = step_data[self._action_key]
             entity_path = f"{self.prefix}action"
             for i, val in enumerate(action_tensor):
-                rr.log(f"{entity_path}/joint_{i}", rr.Scalar(val.item()))
+                rr.log(f"{entity_path}/joint_{i}", rr.Scalars(val.item()))
 
 
 def visualization_data(idx, observation, state, action, online_logger):
